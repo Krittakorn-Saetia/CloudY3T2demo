@@ -60,7 +60,10 @@ class RecordNode:
 @dataclass
 class KeyNode:
     rid: str
-    abe_ct_fingerprint: str    # references the ABE ciphertext in storage
+    abe_ct_fingerprint: str    # short index for graph traversal / commitments
+    # Actual CP-ABE ciphertext (CT_k in the paper). Held by the KMS, used at
+    # decryption time. Typed as Any here to avoid a circular import with abe.py.
+    abe_ct: Any = None
 
 
 @dataclass

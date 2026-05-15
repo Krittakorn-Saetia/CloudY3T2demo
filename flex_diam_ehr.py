@@ -214,7 +214,11 @@ class FlexDiamEHRSystem:
             rid=rid, patient_pid=pid, policy_id=policy_id,
             required_attrs=policy_attrs, phi=phi, uri=uri, created_at=time.time(),
         )
-        key = KeyNode(rid=rid, abe_ct_fingerprint=H(repr(ct_k.C)).hex())
+        key = KeyNode(
+            rid=rid,
+            abe_ct_fingerprint=H(repr(ct_k.C)).hex(),
+            abe_ct=ct_k,   # KMS holds the full CT_k so decryption is possible later
+        )
         self.graphs[domain_id].add_record(rec, key)
 
         # Step 6: prepare a privacy-preserving flag for later cross-domain anchoring
@@ -333,6 +337,78 @@ class FlexDiamEHRSystem:
             self.chain.drain_mempool()
 
         return results
+
+    # ------------------------------------------------------------------
+    # Phase 4 Step 5 (decryption side):
+    #   K_AES <- CP_ABE.Dec(SK_D, CT_k)
+    #   M_agg <- AES.Dec_{K_AES}(CT_m)
+    # ------------------------------------------------------------------
+    def decrypt_record(self, domain_id: str, did: str, rid: str) -> bytes:
+        """Decrypt a single record the doctor has access to.
+
+        Implements the cryptographic half of Phase 4 Step 5: the requester
+        recovers the AES data key from CT_k via their CP-ABE user key, then
+        decrypts the bulk payload CT_m fetched from blob storage. The φ
+        (metadata digest) stored on the RecordNode is used as the AEAD
+        associated-data, binding the ciphertext to its index entry.
+
+        Caller is expected to have already passed the Phase 4 access checks
+        (ZKP verify + policy_constrained_records traversal) via
+        ``verify_and_access`` or ``verify_and_decrypt``.
+        """
+        domain = self.domains[domain_id]
+        graph = self.graphs[domain_id]
+        rec = graph.get_record(rid)
+        key = graph.get_key(rid)
+        if rec is None or key is None or key.abe_ct is None:
+            raise KeyError(f"unknown record or missing CT_k: {rid}")
+        uk = domain.user_abe_keys.get(did)
+        if uk is None:
+            raise PermissionError(f"no CP-ABE user key for {did} in {domain_id}")
+
+        # Step 1: CP-ABE recovers the AES data key
+        data_key = abe_decrypt(domain.abe_pp, key.abe_ct, uk)
+
+        # Step 2: fetch CT_m and AES-decrypt
+        sealed = self.blobs[domain_id].get(rec.uri)
+        if sealed is None:
+            # Check emergency tier (Phase 2 Step 5 hot-tier cache)
+            sealed = self.emergency_cache[domain_id].get(rec.uri)
+        if sealed is None:
+            raise FileNotFoundError(f"blob not found: {rec.uri}")
+        nonce, tag, body = sealed[:12], sealed[12:28], sealed[28:]
+        return aes_decrypt(data_key, nonce, body, tag, ad=rec.phi)
+
+    def verify_and_decrypt(
+        self,
+        domain_id: str,
+        did: str,
+        pid: str,
+        proof: ZKProof,
+        circuit: PolicyCircuit,
+        doctor_attrs: Set[str],
+        anchor_h_pi: bool = False,
+        anchor_access_log: bool = False,
+        requester_kp: Optional[KeyPair] = None,
+    ) -> List[bytes]:
+        """End-to-end Phase 4 entry point: ZK verify -> graph traverse ->
+        AccessEvent log -> CP-ABE.Dec -> AES.Dec -> return plaintexts.
+
+        Mirrors Algorithm 3 in the paper (steps 4 through 10). Use this when
+        you actually need the decrypted records; ``verify_and_access`` is
+        retained for benchmarking the access-control path without paying the
+        decryption cost.
+        """
+        # Re-use verify_and_access for the auth + traversal + (optional) anchoring
+        _ = self.verify_and_access(
+            domain_id, did, pid, proof, circuit, doctor_attrs,
+            anchor_h_pi=anchor_h_pi,
+            anchor_access_log=anchor_access_log,
+            requester_kp=requester_kp,
+        )
+        # Now do the cryptographic recovery for each accessible record
+        records = self.graphs[domain_id].policy_constrained_records(did, pid, doctor_attrs)
+        return [self.decrypt_record(domain_id, did, rec.rid) for rec in records]
 
     # ------------------------------------------------------------------
     # Phase 5: Cross-domain sharing (delegation + ABPRE + flag commit)
@@ -607,6 +683,16 @@ if __name__ == "__main__":
     state = sys.chain.total_chain_state()
     print(f"  on-chain policy commitments: {len(state.policy_commitments)}, "
           f"access logs: {len(state.access_logs)}")
+
+    # Phase 4 Step 5: full decryption round-trip — recover M_agg from CT_m via
+    # CP-ABE.Dec(SK_D, CT_k) + AES.Dec_{K_AES}(CT_m).
+    print("  full decryption round-trip (CP-ABE.Dec + AES.Dec)...")
+    plaintexts = sys.verify_and_decrypt(
+        "hospital_A", "did:doc:alice", "PID:p42",
+        proof, circuit, {"doctor", "cardiologist", "hospital_A"},
+    )
+    print(f"  recovered {len(plaintexts)} plaintext record(s); "
+          f"first record size = {len(plaintexts[0])} bytes")
 
     # Demonstrate amortization: re-access with same proof
     t0 = time.perf_counter()
