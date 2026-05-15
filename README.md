@@ -52,7 +52,6 @@ without a transparent derivation. This rewrite addresses that by:
 | `scheme_31.py`                  | Real implementation of Luo et al. blockchain dynamic auth     |
 | `run_real_experiments.py`       | The six headline experiments (auth / authz / encrypt / delegation / cross-domain / traceability) |
 | `run_novelty_experiments.py`    | Two novelty-isolation experiments (amortization on/off, batching on/off) |
-| `rerun_exp5_only.py`            | Convenience: refresh just Experiment 5                        |
 | `results/`                      | CSVs + PNG plots produced by the runners                      |
 
 ## How to run
