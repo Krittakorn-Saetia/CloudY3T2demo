@@ -48,6 +48,33 @@ from graph_storage import (
 
 
 # -----------------------------------------------------------------------------
+# Paper-faithful identifier derivations (Phase 1 Steps 2-3)
+# -----------------------------------------------------------------------------
+def derive_did(pk_g1, ctx: bytes = b"flex-diam-ehr/v1") -> str:
+    """Decentralized identifier derivation from the paper:
+        DID_E = H(pk_E ‖ ctx)
+
+    Returns a "did:flex:" prefixed hex digest. ``ctx`` is a domain
+    separator so the same key in different deployments yields different
+    DIDs. Pass a deployment-specific context if running multiple
+    parallel consortia.
+    """
+    return "did:flex:" + g1_fingerprint(pk_g1).hex()
+
+
+def derive_pid(pk_patient_g1, nonce: bytes) -> str:
+    """Patient pseudonymized identifier:
+        PID = H(pk_P ‖ r)
+
+    The nonce ``r`` (called ``r`` in the paper) ensures the same patient
+    can be re-registered with an unlinkable PID per enrollment. Callers
+    should persist ``r`` alongside the patient's record so the PID is
+    reproducible by the patient/issuer but not by an observer.
+    """
+    return "PID:" + H(g1_fingerprint(pk_patient_g1), nonce).hex()
+
+
+# -----------------------------------------------------------------------------
 # Hospital domain (each hospital has its own KMS, edge, proxy)
 # -----------------------------------------------------------------------------
 class HospitalDomain:
@@ -210,9 +237,13 @@ class FlexDiamEHRSystem:
         if is_emergency:
             self.emergency_cache[domain_id].put(uri, sealed_payload, ttl_seconds=600.0)
 
+        # Phase 3 Step 1 integrity commitment: h_node binds all metadata
+        # to the encrypted content so tampering is detectable.
+        h_node = H(rid, pid, phi, ",".join(policy_attrs), uri)
         rec = RecordNode(
             rid=rid, patient_pid=pid, policy_id=policy_id,
-            required_attrs=policy_attrs, phi=phi, uri=uri, created_at=time.time(),
+            required_attrs=policy_attrs, phi=phi, uri=uri,
+            created_at=time.time(), h_node=h_node,
         )
         key = KeyNode(
             rid=rid,
@@ -689,6 +720,14 @@ if __name__ == "__main__":
     universe = ["doctor", "cardiologist", "hospital_A", "hospital_B", "emergency"]
     sys.setup(universe)
 
+    # Phase 1 Steps 2-3: derive paper-faithful identifiers
+    alice_kp_preview = keygen()
+    derived_did = derive_did(alice_kp_preview.pk_g1)
+    derived_pid = derive_pid(keygen().pk_g1, secrets.token_bytes(16))
+    print(f"  derived DID example: {derived_did[:24]}...")
+    print(f"  derived PID example: {derived_pid[:24]}...")
+    print("  (using legacy opaque-string DIDs below for demo readability)")
+
     # Register doctors and patient
     kp_alice, uk_alice, vc_alice = sys.register_doctor("hospital_A", "did:doc:alice",
                                                        {"doctor", "cardiologist", "hospital_A"})
@@ -706,6 +745,8 @@ if __name__ == "__main__":
         is_emergency=False,
     )
     print(f"  record sealed: rid={rec_info['rid']}, uri={rec_info['uri'][:24]}...")
+    rec_node = sys.graphs["hospital_A"].get_record("R1")
+    print(f"  h_node integrity commitment: {rec_node.h_node.hex()[:24]}...")
 
     # ZK authenticate and access
     print("\nPhase 4: ZKP auth + amortized verify + policy-constrained traversal")

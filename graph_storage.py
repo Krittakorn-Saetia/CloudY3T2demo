@@ -55,6 +55,12 @@ class RecordNode:
     phi: bytes               # metadata digest (binds to encrypted content)
     uri: str                 # pointer into blob storage
     created_at: float
+    # Phase 3 Step 1: integrity commitment binding all metadata fields.
+    # Computed once at insertion time from H(RID ‖ PID ‖ phi ‖ policy ‖ URI).
+    # An auditor that later tampers with any field in the graph would
+    # produce a different commitment, detecting the mutation (assuming
+    # collision resistance of H).
+    h_node: bytes = b""
 
 
 @dataclass
