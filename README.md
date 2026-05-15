@@ -14,7 +14,7 @@ Every cryptographic operation runs real code:
 | CP-ABE encrypt/decrypt      | implemented in `abe.py` (BSW-style)   |
 | ABPRE rekeygen / re-encrypt | implemented in `abe.py`               |
 | ZK proofs                   | Schnorr-of-Schnorrs, Fiat-Shamir, in `zkp.py` |
-| Consortium blockchain       | PBFT-style, 4 real nodes, real signatures, real consensus, in `blockchain.py` |
+| Ethereum-backed chain       | Real EVM via [Foundry Anvil](https://book.getfoundry.sh/anvil/) (local) or Sepolia testnet (public). Solidity contract in `contracts/FlexDiamEHR.sol`; Python adapter in `eth_blockchain.py`. Replaces the in-process PBFT simulation. |
 | Graph DB (Neo4j-style)      | implemented in `graph_storage.py`     |
 
 There is no cost model. Each scheme actually runs its protocol end-to-end on
@@ -41,7 +41,10 @@ without a transparent derivation. This rewrite addresses that by:
 | `crypto_core.py`                | Hashing, AES, ChaCha20, Schnorr-on-BN128, key generation      |
 | `abe.py`                        | Real CP-ABE encrypt/decrypt + ABPRE rekey/re-encrypt/batch    |
 | `zkp.py`                        | Real ZK proofs with circuit precompilation + amortized verifier |
-| `blockchain.py`                 | Real 4-node consortium blockchain with PBFT consensus         |
+| `contracts/FlexDiamEHR.sol`     | Solidity smart contract: DID registry, flag commitments, policy commits, access logs, delegations (+ generic catch-all) |
+| `eth_blockchain.py`             | Python adapter — spins up Anvil, deploys `FlexDiamEHR.sol`, dispatches each `Transaction` to the contract; **drop-in replacement** for `blockchain.BlockchainNetwork`. One `run_consensus_round()` = one mined Ethereum block (Anvil mempool flushed via `evm_mine`). |
+| `deploy_sepolia.py`             | Deploy `FlexDiamEHR.sol` to the public Sepolia testnet (or any EVM-compatible network) using a wallet + faucet-funded ETH. Persists ABI + address to `deployments/chain_<id>.json`. |
+| `blockchain.py`                 | (legacy) Original in-process PBFT simulation — kept for the `Transaction` / `ChainState` dataclasses that `eth_blockchain` re-uses. No longer used as the chain backend. |
 | `graph_storage.py`              | Policy-constrained graph DB, blob store, emergency TTL cache  |
 | `flex_diam_ehr.py`              | End-to-end FLEX-DIAM-EHR orchestration                        |
 | `scheme_25.py`                  | Real implementation of Wang et al. UAV zero-trust auth         |
@@ -55,15 +58,54 @@ without a transparent derivation. This rewrite addresses that by:
 ## How to run
 
 ```bash
-pip install pycryptodome ecdsa py_ecc matplotlib numpy
+# Python deps. web3.py and py-solc-x are needed for the Ethereum-backed chain;
+# solcx will auto-download the right solc binary on first compile.
+pip install pycryptodome ecdsa py_ecc matplotlib numpy "web3>=6.20,<7" "py-solc-x>=2.0"
+
+# Foundry's Anvil binary is used as the local EVM. On Windows: download
+# foundry_<version>_win32_amd64.zip from
+#   https://github.com/foundry-rs/foundry/releases
+# unzip to ~/.tools/foundry, and either add it to PATH or set
+#   ANVIL_PATH=C:\Users\<you>\.tools\foundry\anvil.exe
+# On macOS / Linux: install via `curl -L https://foundry.paradigm.xyz | bash`
+# and then `foundryup`.
 
 # Full headline experiments (≈ 2-3 hours on the reference machine with
-# REPEATS=3 and the dense x-sampling described below):
-python3 run_real_experiments.py
+# REPEATS=3 and the dense x-sampling described below). Anvil is launched
+# automatically by eth_blockchain.py on port 8545.
+python run_real_experiments.py
 
 # Novelty-isolation experiments (≈ 30-45 minutes):
-python3 run_novelty_experiments.py
+python run_novelty_experiments.py
 ```
+
+### Optional: deploy to the real Sepolia testnet
+
+To prove the chain isn't just local, deploy the same Solidity contract to
+the public Sepolia testnet and get an Etherscan link:
+
+```powershell
+# Get free Sepolia ETH (no credit card needed): https://www.alchemy.com/faucets/ethereum-sepolia
+$env:SEPOLIA_RPC_URL    = "https://ethereum-sepolia-rpc.publicnode.com"
+$env:SEPOLIA_PRIVATE_KEY = "0x<your-test-wallet-private-key>"
+python deploy_sepolia.py
+```
+
+The script prints the deployed contract address and an Etherscan link, and
+writes the ABI + address to `deployments/chain_11155111.json`. The same
+script works against Holesky (`CHAIN_ID=17000`) or any other EVM network.
+
+#### Live Sepolia deployment
+
+`FlexDiamEHR.sol` is deployed on the Sepolia testnet at:
+
+> **Contract:** [`0x11499AFa21a2268712a0BC3E2B3def06AdBf5211`](https://sepolia.etherscan.io/address/0x11499AFa21a2268712a0BC3E2B3def06AdBf5211)
+> **Deploy tx:** [`0x01e8ae93...0xd5bd21079`](https://sepolia.etherscan.io/tx/0x01e8ae931853ef157b5bd1f3a4d51deb4fa868728dce46aa15e9dbbd5bd21079)
+> Deployed at Sepolia block 10,857,024 — gas used 685,433.
+
+All Solidity bytecode, events, and write functions are public-readable on
+Etherscan, which is the strongest available evidence that the chain layer of
+this paper is a real Ethereum deployment, not a simulation.
 
 Each experiment prints a live table to stdout as it runs and writes the CSV +
 PNG into `results/`. Files are **overwritten** on each run — there is no
@@ -209,8 +251,19 @@ ratio.
   knowledge) under the standard discrete-log + random-oracle assumptions.
   It is not Groth16, but the per-attribute cost class (one G1 exponentiation
   per attribute per side) is realistic for a small policy circuit.
-- **PBFT consensus**: 4 nodes, real pre-prepare / prepare / commit phases,
-  real signatures from every node on the block hash.
+- **PBFT consensus** (legacy, in `blockchain.py`): 4 nodes, real pre-prepare /
+  prepare / commit phases, real signatures from every node on the block hash.
+  Retained for the `Transaction` and `ChainState` dataclasses, but no longer
+  used as the chain backend.
+- **Ethereum-backed chain** (current default, in `eth_blockchain.py` +
+  `contracts/FlexDiamEHR.sol`): every transaction goes through a real EVM —
+  locally via [Foundry Anvil](https://book.getfoundry.sh/anvil/) for
+  experiments, optionally to the public Sepolia testnet via
+  `deploy_sepolia.py`. Each `run_consensus_round()` flushes the queued
+  transactions into one mined Ethereum block via Anvil's `evm_mine` RPC, so
+  Scheme [31]'s "one consensus round per cross-domain event" semantics carry
+  over unchanged. App-layer BN128 Schnorr signatures (the paper's identity
+  binding) are still verified before relaying.
 
 ### Bugs found and fixed during development
 1. **Issuer-anchor clobbering**: an earlier version of `register_doctor`

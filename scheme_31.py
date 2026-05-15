@@ -26,7 +26,7 @@ from crypto_core import (
     H, aes_encrypt, aes_decrypt, keygen, KeyPair,
     schnorr_sign, schnorr_verify,
 )
-from blockchain import BlockchainNetwork, Transaction
+from eth_blockchain import BlockchainNetwork, Transaction
 
 
 # -----------------------------------------------------------------------------

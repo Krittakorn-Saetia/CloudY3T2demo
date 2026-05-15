@@ -28,7 +28,7 @@ from ecdsa import SigningKey, VerifyingKey, NIST256p
 from ecdsa.ellipticcurve import PointJacobi
 
 from crypto_core import H, aes_encrypt, aes_decrypt
-from blockchain import BlockchainNetwork, Transaction
+from eth_blockchain import BlockchainNetwork, Transaction
 
 
 # -----------------------------------------------------------------------------

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local-only logs from one-off smoke tests
+*.log
+
+# Local Anvil keystores or any secrets (just in case)
+.env
+*.env
+sepolia_*.txt
+private_key.txt
+
+# Build / virtualenv leftovers
+build/
+dist/
+*.egg-info/
+.venv/
+venv/

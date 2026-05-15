@@ -30,7 +30,7 @@ from abe import (
     ABEPublicParams, ABEMasterKey, ABEUserKey, ABECiphertext,
     abe_setup, abe_keygen, abe_encrypt, abe_decrypt,
 )
-from blockchain import BlockchainNetwork, Transaction
+from eth_blockchain import BlockchainNetwork, Transaction
 
 
 # -----------------------------------------------------------------------------

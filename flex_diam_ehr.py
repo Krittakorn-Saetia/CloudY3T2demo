@@ -38,7 +38,7 @@ from zkp import (
     ZKProof, AmortizedProofVerifier,
     issue_credential, zk_prove, zk_verify,
 )
-from blockchain import (
+from eth_blockchain import (
     BlockchainNetwork, Transaction,
 )
 from graph_storage import (
