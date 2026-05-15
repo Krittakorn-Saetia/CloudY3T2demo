@@ -253,8 +253,22 @@ class FlexDiamEHRSystem:
         proof: ZKProof,
         circuit: PolicyCircuit,
         doctor_attrs: Set[str],
+        anchor_h_pi: bool = False,
+        anchor_access_log: bool = False,
+        requester_kp: Optional[KeyPair] = None,
     ) -> List[bytes]:
-        """Verify ZK proof and grant access to all matching records (amortized)."""
+        """Verify ZK proof and grant access to all matching records (amortized).
+
+        When ``anchor_h_pi`` is True, the hash of the ZK proof (``h_π``) is
+        committed on-chain via the FlexDiamEHR.sol ``commitPolicy`` event,
+        matching Phase 4 Step 4 of the paper. When ``anchor_access_log`` is
+        True, each AccessEvent is also anchored via ``logAccess`` (Phase 4
+        Step 6's "optionally anchored on-chain"). Both default to False so
+        experiment timings stay comparable to the off-chain-only baseline.
+
+        ``requester_kp`` is required when anchoring is enabled — the chain
+        transactions must be signed by the requester's BN128 Schnorr key.
+        """
         verifier = self.verifiers[domain_id]
         ok = verifier.verify(circuit, proof)
         if not ok:
@@ -263,22 +277,60 @@ class FlexDiamEHRSystem:
         # Policy-constrained graph traversal
         records = self.graphs[domain_id].policy_constrained_records(did, pid, doctor_attrs)
 
-        # Decrypt each record's data key with the doctor's ABE key
-        # NOTE: this is where amortization saves time — the proof was verified once
-        # but we now grant access to ALL these records.
-        domain = self.domains[domain_id]
-        uk = domain.user_abe_keys[did]
+        # h_π = H(proof) — same digest the smart contract receives for anchoring.
+        # NOTE: amortization saves time here — the proof was verified once
+        # but we now grant access to ALL the records the policy allows.
+        h_pi_hex = H(repr(proof.challenge), *proof.commits.values()).hex()
+
+        # Phase 4 Step 4: anchor h_π once per access session
+        if anchor_h_pi and records:
+            if requester_kp is None:
+                raise ValueError("anchor_h_pi=True requires requester_kp")
+            policy_tx = Transaction(
+                tx_type="policy_commit",
+                payload={
+                    "h_pi": h_pi_hex,
+                    "policy_id": circuit.policy_id,
+                },
+                sender_id=did,
+                nonce=secrets.randbelow(2**31),
+                timestamp=time.time(),
+            )
+            policy_tx.sign(requester_kp.sk)
+            self.chain.broadcast_tx(policy_tx)
 
         results = []
         for rec in records:
-            # Log access (lightweight, off-chain; on-chain is batched)
+            # Log access (lightweight, off-chain by default)
             ev = AccessEvent(
                 session_id=H(session_token := secrets.token_bytes(16)).hex(),
                 did=did, rid=rec.rid, timestamp=time.time(),
-                h_pi=H(repr(proof.challenge), *proof.commits.values()).hex(),
+                h_pi=h_pi_hex,
             )
             self.graphs[domain_id].log_access(ev)
+
+            # Phase 4 Step 6: optionally anchor each access on-chain too
+            if anchor_access_log:
+                if requester_kp is None:
+                    raise ValueError("anchor_access_log=True requires requester_kp")
+                log_tx = Transaction(
+                    tx_type="access_log",
+                    payload={
+                        "record_id": rec.rid,
+                        "h_pi": h_pi_hex,
+                    },
+                    sender_id=did,
+                    nonce=secrets.randbelow(2**31),
+                    timestamp=time.time(),
+                )
+                log_tx.sign(requester_kp.sk)
+                self.chain.broadcast_tx(log_tx)
+
             results.append(rec.uri.encode())   # return URI references; payload decrypt is separate
+
+        # Flush any chain txs we queued so callers can see results
+        if anchor_h_pi or anchor_access_log:
+            self.chain.drain_mempool()
 
         return results
 
@@ -544,6 +596,17 @@ if __name__ == "__main__":
     uris = sys.verify_and_access("hospital_A", "did:doc:alice", "PID:p42",
                                   proof, circuit, {"doctor", "cardiologist", "hospital_A"})
     print(f"  records accessible: {len(uris)}")
+
+    # Phase 4 Steps 4 + 6: anchor h_pi and access logs on-chain once
+    print("  anchoring h_pi (policy_commit) + access_log on-chain...")
+    sys.verify_and_access(
+        "hospital_A", "did:doc:alice", "PID:p42",
+        proof, circuit, {"doctor", "cardiologist", "hospital_A"},
+        anchor_h_pi=True, anchor_access_log=True, requester_kp=kp_alice,
+    )
+    state = sys.chain.total_chain_state()
+    print(f"  on-chain policy commitments: {len(state.policy_commitments)}, "
+          f"access logs: {len(state.access_logs)}")
 
     # Demonstrate amortization: re-access with same proof
     t0 = time.perf_counter()
