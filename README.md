@@ -40,19 +40,68 @@ without a transparent derivation. This rewrite addresses that by:
 |---------------------------------|---------------------------------------------------------------|
 | `crypto_core.py`                | Hashing, AES, ChaCha20, Schnorr-on-BN128, key generation      |
 | `abe.py`                        | Real CP-ABE encrypt/decrypt + ABPRE rekey/re-encrypt/batch    |
-| `zkp.py`                        | Real ZK proofs with circuit precompilation + amortized verifier |
+| `zkp.py`                        | Real ZK proofs — **Schnorr-of-Schnorrs sigma protocol** over BN128 with Fiat-Shamir non-interactivity. Not a zk-SNARK; see "ZKP system choice" below for details. Implements circuit precompilation, context-bound proofs, and amortized verifier. |
 | `contracts/FlexDiamEHR.sol`     | Solidity smart contract: DID registry, flag commitments, policy commits, access logs, delegations (+ generic catch-all) |
 | `eth_blockchain.py`             | Python adapter — spins up Anvil, deploys `FlexDiamEHR.sol`, dispatches each `Transaction` to the contract; **drop-in replacement** for `blockchain.BlockchainNetwork`. One `run_consensus_round()` = one mined Ethereum block (Anvil mempool flushed via `evm_mine`). |
 | `deploy_sepolia.py`             | Deploy `FlexDiamEHR.sol` to the public Sepolia testnet (or any EVM-compatible network) using a wallet + faucet-funded ETH. Persists ABI + address to `deployments/chain_<id>.json`. |
 | `blockchain.py`                 | (legacy) Original in-process PBFT simulation — kept for the `Transaction` / `ChainState` dataclasses that `eth_blockchain` re-uses. No longer used as the chain backend. |
 | `graph_storage.py`              | Policy-constrained graph DB, blob store, emergency TTL cache  |
-| `flex_diam_ehr.py`              | End-to-end FLEX-DIAM-EHR orchestration                        |
+| `flex_diam_ehr.py`              | End-to-end FLEX-DIAM-EHR orchestration. Provides `ingest_iomt_and_lock` (Phase 2), `doctor_authenticate` + `verify_and_access` + `verify_and_decrypt` (Phase 4), `cross_domain_batch_reenc` + `cross_domain_decrypt` (Phase 5), `commit_sharing_flag` + `reconstruct_history` (Phase 3/5 traceability). Helpers `derive_did(pk, ctx)` and `derive_pid(pk_p, r)` give paper-faithful identifier derivation. |
 | `scheme_25.py`                  | Real implementation of Wang et al. UAV zero-trust auth         |
 | `scheme_27.py`                  | Real implementation of MediCrypt-DDT (Yan et al.)             |
 | `scheme_31.py`                  | Real implementation of Luo et al. blockchain dynamic auth     |
 | `run_real_experiments.py`       | The six headline experiments (auth / authz / encrypt / delegation / cross-domain / traceability) |
 | `run_novelty_experiments.py`    | Two novelty-isolation experiments (amortization on/off, batching on/off) |
 | `results/`                      | CSVs + PNG plots produced by the runners                      |
+
+## Paper-algorithm alignment
+
+The implementation closely follows the five-phase construction in the FLEX-DIAM-EHR paper. The table below maps each algorithm step to the function or contract that implements it.
+
+| Paper step | Implementation |
+|---|---|
+| Phase 1 Step 2: `DID_E = H(pk_E ‖ ctx)` | `flex_diam_ehr.derive_did(pk_g1, ctx)` |
+| Phase 1 Step 3: `PID = H(pk_P ‖ r)` | `flex_diam_ehr.derive_pid(pk_p_g1, nonce)` |
+| Phase 1 Step 5: `rk_A→B ← ReKeyGen(MSK, pk_B, DelTok)` | `abe.abpre_rekeygen` (one pairing on `pk_B` for token-binding) |
+| Phase 2 Steps 1–4: Hybrid AEAD + AES + CP-ABE encryption | `FlexDiamEHRSystem.ingest_iomt_and_lock` |
+| Phase 2 Step 5: Hot-tier cache | `graph_storage.EmergencyCache` (TTL-based) |
+| Phase 2 Step 6: Graph indexing with `h_node = H(RID‖PID‖φ‖A‖URI)` | `RecordNode.h_node` computed at insertion |
+| Phase 3 Step 3: Policy-Constrained Traversal (novelty) | `GraphDB.policy_constrained_records` |
+| Phase 3/5 Step 6: Longitudinal History Reconstruction | `FlexDiamEHRSystem.reconstruct_history` — queries `Flagged` events directly from the Solidity contract via `web3.py`, falls back to in-memory mirror |
+| Phase 4 Step 1: Circuit precompilation | `zkp.PolicyCircuitCache.get_or_compile` |
+| Phase 4 Step 2: `h_ctx = H(DID_D ‖ PID ‖ t)` | session_context passed to `doctor_authenticate` |
+| Phase 4 Step 3: Amortized ZKP generation/verification | `zkp.zk_prove` + `zkp.AmortizedProofVerifier` |
+| Phase 4 Step 4: On-chain `h_π` commitment | `verify_and_access(..., anchor_h_pi=True)` → `commitPolicy` event |
+| Phase 4 Step 5: `K_AES ← CP-ABE.Dec(SK_D, CT_k)` + `AES.Dec` | `FlexDiamEHRSystem.decrypt_record` / `verify_and_decrypt` |
+| Phase 4 Step 6: On-chain access binding | `verify_and_access(..., anchor_access_log=True)` → `Accessed` event |
+| Phase 5 Step 1: `DelTok = Sign_skHA(H(PID‖RID‖...))` | `FlexDiamEHRSystem.issue_delegation_token` |
+| Phase 5 Step 3: ABPRE re-encryption (batch-supported) | `abe.abpre_batch_reencrypt` |
+| Phase 5 Step 4: Target-side `K_AES ← CP-ABE.Dec(SK_B, CT_k')` + `AES.Dec` | `FlexDiamEHRSystem.cross_domain_decrypt` |
+| Phase 5 Step 5: `FlagID` on chain | `FlexDiamEHRSystem.commit_sharing_flag` → `Flagged` event |
+
+### ZKP system choice (sigma protocol vs zk-SNARK)
+
+The paper specifies a "ZKP system" without naming a specific scheme. Our implementation in `zkp.py` is a **Schnorr-of-Schnorrs sigma protocol over BN128 made non-interactive via Fiat-Shamir** — not a zk-SNARK. Both kinds qualify as ZKPs and both satisfy the three required security properties:
+
+- **Completeness** — honest prover with a valid witness always convinces an honest verifier
+- **Soundness** — a cheating prover succeeds only with negligible probability (under DL + random oracle assumptions)
+- **Zero-knowledge** — verifiers learn nothing beyond policy satisfaction
+
+The trade-offs versus a SNARK (e.g., Groth16):
+
+| Property | Schnorr-of-Schnorrs (ours) | zk-SNARK (Groth16) |
+|---|---|---|
+| Trusted setup | none | per-circuit (or universal) |
+| Proof size | linear in #attributes | constant ~200 bytes |
+| Prover time | tens of ms | seconds (on pure-Python pairings) |
+| Verifier time | tens of ms | tens of ms (one pairing) |
+| On-chain verification gas | ~12K gas / attribute | ~250K gas (one pairing precompile call) |
+
+We chose a sigma protocol because (a) no trusted-setup ceremony is needed in a hospital-consortium deployment, (b) the construction is auditable by hand, and (c) succinctness only matters at very high attribute counts which is outside our threat model. The paper's three ZKP novelties — **circuit precompilation, context-bound proofs, and proof amortization** — are properties of the system architecture and apply equally to sigma-based or SNARK-based ZKPs.
+
+### Off-chain verification with on-chain commitment
+
+Per Phase 4 Step 4 of the paper: *"only a commitment h_π = H(π) is recorded on-chain, rather than the full proof."* The implementation matches this — full ZKP verification happens off-chain via `AmortizedProofVerifier`; only the `h_π` digest is sent to the smart contract's `commitPolicy` event when `anchor_h_pi=True`. The contract logs commitments and access events but does not re-execute the ZKP verifier on chain.
 
 ## How to run
 

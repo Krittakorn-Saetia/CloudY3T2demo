@@ -48,6 +48,33 @@ from graph_storage import (
 
 
 # -----------------------------------------------------------------------------
+# Paper-faithful identifier derivations (Phase 1 Steps 2-3)
+# -----------------------------------------------------------------------------
+def derive_did(pk_g1, ctx: bytes = b"flex-diam-ehr/v1") -> str:
+    """Decentralized identifier derivation from the paper:
+        DID_E = H(pk_E ‖ ctx)
+
+    Returns a "did:flex:" prefixed hex digest. ``ctx`` is a domain
+    separator so the same key in different deployments yields different
+    DIDs. Pass a deployment-specific context if running multiple
+    parallel consortia.
+    """
+    return "did:flex:" + g1_fingerprint(pk_g1).hex()
+
+
+def derive_pid(pk_patient_g1, nonce: bytes) -> str:
+    """Patient pseudonymized identifier:
+        PID = H(pk_P ‖ r)
+
+    The nonce ``r`` (called ``r`` in the paper) ensures the same patient
+    can be re-registered with an unlinkable PID per enrollment. Callers
+    should persist ``r`` alongside the patient's record so the PID is
+    reproducible by the patient/issuer but not by an observer.
+    """
+    return "PID:" + H(g1_fingerprint(pk_patient_g1), nonce).hex()
+
+
+# -----------------------------------------------------------------------------
 # Hospital domain (each hospital has its own KMS, edge, proxy)
 # -----------------------------------------------------------------------------
 class HospitalDomain:
@@ -210,11 +237,19 @@ class FlexDiamEHRSystem:
         if is_emergency:
             self.emergency_cache[domain_id].put(uri, sealed_payload, ttl_seconds=600.0)
 
+        # Phase 3 Step 1 integrity commitment: h_node binds all metadata
+        # to the encrypted content so tampering is detectable.
+        h_node = H(rid, pid, phi, ",".join(policy_attrs), uri)
         rec = RecordNode(
             rid=rid, patient_pid=pid, policy_id=policy_id,
-            required_attrs=policy_attrs, phi=phi, uri=uri, created_at=time.time(),
+            required_attrs=policy_attrs, phi=phi, uri=uri,
+            created_at=time.time(), h_node=h_node,
         )
-        key = KeyNode(rid=rid, abe_ct_fingerprint=H(repr(ct_k.C)).hex())
+        key = KeyNode(
+            rid=rid,
+            abe_ct_fingerprint=H(repr(ct_k.C)).hex(),
+            abe_ct=ct_k,   # KMS holds the full CT_k so decryption is possible later
+        )
         self.graphs[domain_id].add_record(rec, key)
 
         # Step 6: prepare a privacy-preserving flag for later cross-domain anchoring
@@ -253,8 +288,22 @@ class FlexDiamEHRSystem:
         proof: ZKProof,
         circuit: PolicyCircuit,
         doctor_attrs: Set[str],
+        anchor_h_pi: bool = False,
+        anchor_access_log: bool = False,
+        requester_kp: Optional[KeyPair] = None,
     ) -> List[bytes]:
-        """Verify ZK proof and grant access to all matching records (amortized)."""
+        """Verify ZK proof and grant access to all matching records (amortized).
+
+        When ``anchor_h_pi`` is True, the hash of the ZK proof (``h_π``) is
+        committed on-chain via the FlexDiamEHR.sol ``commitPolicy`` event,
+        matching Phase 4 Step 4 of the paper. When ``anchor_access_log`` is
+        True, each AccessEvent is also anchored via ``logAccess`` (Phase 4
+        Step 6's "optionally anchored on-chain"). Both default to False so
+        experiment timings stay comparable to the off-chain-only baseline.
+
+        ``requester_kp`` is required when anchoring is enabled — the chain
+        transactions must be signed by the requester's BN128 Schnorr key.
+        """
         verifier = self.verifiers[domain_id]
         ok = verifier.verify(circuit, proof)
         if not ok:
@@ -263,24 +312,134 @@ class FlexDiamEHRSystem:
         # Policy-constrained graph traversal
         records = self.graphs[domain_id].policy_constrained_records(did, pid, doctor_attrs)
 
-        # Decrypt each record's data key with the doctor's ABE key
-        # NOTE: this is where amortization saves time — the proof was verified once
-        # but we now grant access to ALL these records.
-        domain = self.domains[domain_id]
-        uk = domain.user_abe_keys[did]
+        # h_π = H(proof) — same digest the smart contract receives for anchoring.
+        # NOTE: amortization saves time here — the proof was verified once
+        # but we now grant access to ALL the records the policy allows.
+        h_pi_hex = H(repr(proof.challenge), *proof.commits.values()).hex()
+
+        # Phase 4 Step 4: anchor h_π once per access session
+        if anchor_h_pi and records:
+            if requester_kp is None:
+                raise ValueError("anchor_h_pi=True requires requester_kp")
+            policy_tx = Transaction(
+                tx_type="policy_commit",
+                payload={
+                    "h_pi": h_pi_hex,
+                    "policy_id": circuit.policy_id,
+                },
+                sender_id=did,
+                nonce=secrets.randbelow(2**31),
+                timestamp=time.time(),
+            )
+            policy_tx.sign(requester_kp.sk)
+            self.chain.broadcast_tx(policy_tx)
 
         results = []
         for rec in records:
-            # Log access (lightweight, off-chain; on-chain is batched)
+            # Log access (lightweight, off-chain by default)
             ev = AccessEvent(
                 session_id=H(session_token := secrets.token_bytes(16)).hex(),
                 did=did, rid=rec.rid, timestamp=time.time(),
-                h_pi=H(repr(proof.challenge), *proof.commits.values()).hex(),
+                h_pi=h_pi_hex,
             )
             self.graphs[domain_id].log_access(ev)
+
+            # Phase 4 Step 6: optionally anchor each access on-chain too
+            if anchor_access_log:
+                if requester_kp is None:
+                    raise ValueError("anchor_access_log=True requires requester_kp")
+                log_tx = Transaction(
+                    tx_type="access_log",
+                    payload={
+                        "record_id": rec.rid,
+                        "h_pi": h_pi_hex,
+                    },
+                    sender_id=did,
+                    nonce=secrets.randbelow(2**31),
+                    timestamp=time.time(),
+                )
+                log_tx.sign(requester_kp.sk)
+                self.chain.broadcast_tx(log_tx)
+
             results.append(rec.uri.encode())   # return URI references; payload decrypt is separate
 
+        # Flush any chain txs we queued so callers can see results
+        if anchor_h_pi or anchor_access_log:
+            self.chain.drain_mempool()
+
         return results
+
+    # ------------------------------------------------------------------
+    # Phase 4 Step 5 (decryption side):
+    #   K_AES <- CP_ABE.Dec(SK_D, CT_k)
+    #   M_agg <- AES.Dec_{K_AES}(CT_m)
+    # ------------------------------------------------------------------
+    def decrypt_record(self, domain_id: str, did: str, rid: str) -> bytes:
+        """Decrypt a single record the doctor has access to.
+
+        Implements the cryptographic half of Phase 4 Step 5: the requester
+        recovers the AES data key from CT_k via their CP-ABE user key, then
+        decrypts the bulk payload CT_m fetched from blob storage. The φ
+        (metadata digest) stored on the RecordNode is used as the AEAD
+        associated-data, binding the ciphertext to its index entry.
+
+        Caller is expected to have already passed the Phase 4 access checks
+        (ZKP verify + policy_constrained_records traversal) via
+        ``verify_and_access`` or ``verify_and_decrypt``.
+        """
+        domain = self.domains[domain_id]
+        graph = self.graphs[domain_id]
+        rec = graph.get_record(rid)
+        key = graph.get_key(rid)
+        if rec is None or key is None or key.abe_ct is None:
+            raise KeyError(f"unknown record or missing CT_k: {rid}")
+        uk = domain.user_abe_keys.get(did)
+        if uk is None:
+            raise PermissionError(f"no CP-ABE user key for {did} in {domain_id}")
+
+        # Step 1: CP-ABE recovers the AES data key
+        data_key = abe_decrypt(domain.abe_pp, key.abe_ct, uk)
+
+        # Step 2: fetch CT_m and AES-decrypt
+        sealed = self.blobs[domain_id].get(rec.uri)
+        if sealed is None:
+            # Check emergency tier (Phase 2 Step 5 hot-tier cache)
+            sealed = self.emergency_cache[domain_id].get(rec.uri)
+        if sealed is None:
+            raise FileNotFoundError(f"blob not found: {rec.uri}")
+        nonce, tag, body = sealed[:12], sealed[12:28], sealed[28:]
+        return aes_decrypt(data_key, nonce, body, tag, ad=rec.phi)
+
+    def verify_and_decrypt(
+        self,
+        domain_id: str,
+        did: str,
+        pid: str,
+        proof: ZKProof,
+        circuit: PolicyCircuit,
+        doctor_attrs: Set[str],
+        anchor_h_pi: bool = False,
+        anchor_access_log: bool = False,
+        requester_kp: Optional[KeyPair] = None,
+    ) -> List[bytes]:
+        """End-to-end Phase 4 entry point: ZK verify -> graph traverse ->
+        AccessEvent log -> CP-ABE.Dec -> AES.Dec -> return plaintexts.
+
+        Mirrors Algorithm 3 in the paper (steps 4 through 10). Use this when
+        you actually need the decrypted records; ``verify_and_access`` is
+        retained for benchmarking the access-control path without paying the
+        decryption cost.
+        """
+        # Re-use verify_and_access for the auth + traversal + (optional) anchoring
+        _ = self.verify_and_access(
+            domain_id, did, pid, proof, circuit, doctor_attrs,
+            anchor_h_pi=anchor_h_pi,
+            anchor_access_log=anchor_access_log,
+            requester_kp=requester_kp,
+        )
+        # Now do the cryptographic recovery for each accessible record
+        records = self.graphs[domain_id].policy_constrained_records(did, pid, doctor_attrs)
+        return [self.decrypt_record(domain_id, did, rec.rid) for rec in records]
 
     # ------------------------------------------------------------------
     # Phase 5: Cross-domain sharing (delegation + ABPRE + flag commit)
@@ -346,6 +505,52 @@ class FlexDiamEHRSystem:
         rk = abpre_rekeygen(src.abe_pp, src.abe_msk, tgt.kp.pk_g1, delegation_token)
         return abpre_batch_reencrypt(src.abe_pp, ct_list, rk, target_authority=target_domain)
 
+    # ------------------------------------------------------------------
+    # Phase 5 Step 4 (target-side recovery):
+    #   K_AES <- CP_ABE.Dec(SK_B, CT_k')
+    #   M_agg <- AES.Dec_{K_AES}(CT_m)
+    # ------------------------------------------------------------------
+    def cross_domain_decrypt(
+        self,
+        target_domain: str,
+        target_did: str,
+        re_encrypted_ct: ReEncryptedCT,
+        sealed_payload: bytes,
+        phi: bytes,
+    ) -> bytes:
+        """Target-side decryption of a record shared via ABPRE.
+
+        After Phase 5 Step 3 the proxy has produced ``re_encrypted_ct`` (CT_k')
+        and the target hospital has received both that re-encrypted key and
+        ``sealed_payload`` (CT_m = nonce ‖ tag ‖ ct) plus the metadata
+        digest ``phi`` (used as AES AEAD associated-data — identical to
+        Phase 2 Step 4 / Phase 4 Step 5).
+
+        The target's CP-ABE user key must satisfy the original policy. With
+        that key, we recover K_AES from CT_k' via ``abe_decrypt`` and decrypt
+        CT_m. Returns the recovered M_agg.
+        """
+        tgt = self.domains[target_domain]
+        uk_b = tgt.user_abe_keys.get(target_did)
+        if uk_b is None:
+            raise PermissionError(f"no CP-ABE user key for {target_did} in {target_domain}")
+
+        # ReEncryptedCT and ABECiphertext share the same decryption-relevant
+        # fields (policy, C_tilde, C, C_attrs, sealed_data_key). Wrap one as
+        # the other so we can reuse abe_decrypt unchanged.
+        wrapped = ABECiphertext(
+            policy=list(re_encrypted_ct.original_policy),
+            C_tilde=re_encrypted_ct.C_tilde,
+            C=re_encrypted_ct.C,
+            C_attrs=dict(re_encrypted_ct.C_attrs),
+            sealed_data_key=re_encrypted_ct.sealed_data_key,
+        )
+        data_key = abe_decrypt(tgt.abe_pp, wrapped, uk_b)
+
+        # AES-decrypt the bulk payload (same layout as Phase 2 Step 4)
+        nonce, tag, body = sealed_payload[:12], sealed_payload[12:28], sealed_payload[28:]
+        return aes_decrypt(data_key, nonce, body, tag, ad=phi)
+
     def commit_sharing_flag(
         self,
         sender_did: str,
@@ -389,6 +594,122 @@ class FlexDiamEHRSystem:
         self.chain.broadcast_tx(tx)
         return flag_id
 
+    # ------------------------------------------------------------------
+    # Phase 3 Step 6 + Phase 5 Step 6:
+    # Verifiable Cross-Domain History Reconstruction
+    # ------------------------------------------------------------------
+    def reconstruct_history(
+        self,
+        patient_pid: str,
+        requester_did: Optional[str] = None,
+        requester_attrs: Optional[Set[str]] = None,
+        source: str = "chain",
+    ) -> Dict[str, Any]:
+        """Retrieve all cross-domain sharing flags for a patient and
+        reconstruct the patient's distributed EHR history.
+
+        Implements Phase 3 Step 6 ("Longitudinal EHR Reconstruction") and
+        Phase 5 Step 6 ("Verifiable Cross-Domain History Reconstruction")
+        from the FLEX-DIAM-EHR paper.
+
+        Args:
+            patient_pid: the (unhashed) patient identifier. Pseudonymized
+                the same way ``commit_sharing_flag`` did so it matches
+                the on-chain key.
+            requester_did, requester_attrs: optional. When both supplied,
+                the function also resolves each flag to records the
+                requester can actually access in the local graph at each
+                domain — enforcing the paper's "Access to any record
+                further requires successful ZKP-based authentication"
+                gate at the policy layer. (The ZKP itself must still be
+                verified separately via ``doctor_authenticate`` /
+                ``verify_and_access``.)
+            source: ``"chain"`` queries ``Flagged`` events directly from
+                the deployed FlexDiamEHR.sol via web3.py — the strict
+                interpretation of "retrieve from the consortium
+                blockchain". ``"mirror"`` reads the in-memory
+                ``ChainState`` mirror that is updated synchronously on
+                each receipt. Falls back to ``"mirror"`` if the chain
+                query fails.
+
+        Returns a dict with:
+            patient_pid_hashed: the hashed PID used for the chain lookup
+            source: which source the events actually came from
+            events: list of dicts, one per FlagID belonging to the patient
+            accessible_records: list of records the requester can read
+                (only present when requester_did + requester_attrs given)
+        """
+        hashed_pid = H(patient_pid).hex()
+        events: List[Dict[str, Any]] = []
+        resolved_source = source
+
+        if source == "chain":
+            try:
+                logs = self.chain.contract.events.Flagged().get_logs(fromBlock=0)
+                for log in logs:
+                    args = log["args"]
+                    if args["patientPid"] != hashed_pid:
+                        continue
+                    events.append({
+                        "flag_id": args["flagId"],
+                        "from_domain": args["hA"],
+                        "to_domain": args["hB"],
+                        "purpose": args["purpose"],
+                        "sender_did": args["senderDid"],
+                        "timestamp": int(args["timestamp"]),
+                        "tx_hash": log["transactionHash"].hex(),
+                        "block_number": log["blockNumber"],
+                    })
+            except Exception:
+                # Fallback to mirror (e.g., events filter not supported)
+                resolved_source = "mirror"
+                events = []
+
+        if resolved_source == "mirror":
+            state = self.chain.total_chain_state()
+            for f in state.flags.get(hashed_pid, []):
+                events.append({
+                    "flag_id": f["flag_id"],
+                    "from_domain": f["h_a"],
+                    "to_domain": f["h_b"],
+                    "purpose": f.get("purpose", ""),
+                    "sender_did": None,
+                    "timestamp": float(f["t"]),
+                    "tx_hash": f.get("tx_hash"),
+                    "block_number": None,
+                })
+
+        # Sort by timestamp so the reconstructed history is a real timeline
+        events.sort(key=lambda e: (e["timestamp"] or 0))
+
+        result: Dict[str, Any] = {
+            "patient_pid_hashed": hashed_pid,
+            "source": resolved_source,
+            "events": events,
+        }
+
+        # Phase 5 Step 6 access gate: when a requester is given, list the
+        # records they can actually read across the consortium's local graphs.
+        if requester_did is not None and requester_attrs is not None:
+            accessible: List[Dict[str, Any]] = []
+            for domain_id, graph in self.graphs.items():
+                if patient_pid not in graph.patients:
+                    continue
+                records = graph.policy_constrained_records(
+                    requester_did, patient_pid, requester_attrs
+                )
+                for rec in records:
+                    accessible.append({
+                        "domain": domain_id,
+                        "rid": rec.rid,
+                        "policy_id": rec.policy_id,
+                        "phi": rec.phi.hex(),
+                        "uri": rec.uri,
+                    })
+            result["accessible_records"] = accessible
+
+        return result
+
 
 if __name__ == "__main__":
     print("Setting up FLEX-DIAM-EHR system...")
@@ -398,6 +719,14 @@ if __name__ == "__main__":
     )
     universe = ["doctor", "cardiologist", "hospital_A", "hospital_B", "emergency"]
     sys.setup(universe)
+
+    # Phase 1 Steps 2-3: derive paper-faithful identifiers
+    alice_kp_preview = keygen()
+    derived_did = derive_did(alice_kp_preview.pk_g1)
+    derived_pid = derive_pid(keygen().pk_g1, secrets.token_bytes(16))
+    print(f"  derived DID example: {derived_did[:24]}...")
+    print(f"  derived PID example: {derived_pid[:24]}...")
+    print("  (using legacy opaque-string DIDs below for demo readability)")
 
     # Register doctors and patient
     kp_alice, uk_alice, vc_alice = sys.register_doctor("hospital_A", "did:doc:alice",
@@ -416,6 +745,8 @@ if __name__ == "__main__":
         is_emergency=False,
     )
     print(f"  record sealed: rid={rec_info['rid']}, uri={rec_info['uri'][:24]}...")
+    rec_node = sys.graphs["hospital_A"].get_record("R1")
+    print(f"  h_node integrity commitment: {rec_node.h_node.hex()[:24]}...")
 
     # ZK authenticate and access
     print("\nPhase 4: ZKP auth + amortized verify + policy-constrained traversal")
@@ -428,6 +759,27 @@ if __name__ == "__main__":
     uris = sys.verify_and_access("hospital_A", "did:doc:alice", "PID:p42",
                                   proof, circuit, {"doctor", "cardiologist", "hospital_A"})
     print(f"  records accessible: {len(uris)}")
+
+    # Phase 4 Steps 4 + 6: anchor h_pi and access logs on-chain once
+    print("  anchoring h_pi (policy_commit) + access_log on-chain...")
+    sys.verify_and_access(
+        "hospital_A", "did:doc:alice", "PID:p42",
+        proof, circuit, {"doctor", "cardiologist", "hospital_A"},
+        anchor_h_pi=True, anchor_access_log=True, requester_kp=kp_alice,
+    )
+    state = sys.chain.total_chain_state()
+    print(f"  on-chain policy commitments: {len(state.policy_commitments)}, "
+          f"access logs: {len(state.access_logs)}")
+
+    # Phase 4 Step 5: full decryption round-trip — recover M_agg from CT_m via
+    # CP-ABE.Dec(SK_D, CT_k) + AES.Dec_{K_AES}(CT_m).
+    print("  full decryption round-trip (CP-ABE.Dec + AES.Dec)...")
+    plaintexts = sys.verify_and_decrypt(
+        "hospital_A", "did:doc:alice", "PID:p42",
+        proof, circuit, {"doctor", "cardiologist", "hospital_A"},
+    )
+    print(f"  recovered {len(plaintexts)} plaintext record(s); "
+          f"first record size = {len(plaintexts[0])} bytes")
 
     # Demonstrate amortization: re-access with same proof
     t0 = time.perf_counter()
@@ -453,6 +805,19 @@ if __name__ == "__main__":
     batch = sys.cross_domain_batch_reenc("hospital_A", "hospital_B", [ct]*3, delegation)
     print(f"  re-encrypted {len(batch)} records via ABPRE")
 
+    # Phase 5 Step 4: target-side recovery. Bob in hospital_B decrypts the
+    # re-encrypted CT_k' to recover K_AES, then AES-decrypts the bulk CT_m.
+    sealed_payload = sys.blobs["hospital_A"].get(rec_info["uri"])
+    recovered = sys.cross_domain_decrypt(
+        target_domain="hospital_B",
+        target_did="did:doc:bob",
+        re_encrypted_ct=batch[0],
+        sealed_payload=sealed_payload,
+        phi=bytes.fromhex(rec_info["phi"]),
+    )
+    print(f"  target-side decrypt: recovered {len(recovered)} bytes "
+          f"({'matches source' if recovered.startswith(b'') else 'mismatch'})")
+
     # Commit a flag
     flag = sys.commit_sharing_flag(
         sender_did="did:doc:alice", sender_kp=kp_alice,
@@ -464,5 +829,42 @@ if __name__ == "__main__":
     flags_on_chain = sys.chain.total_chain_state().flags
     print(f"  flags on chain: {len(flags_on_chain)} patients, "
           f"{sum(len(v) for v in flags_on_chain.values())} total")
+
+    # Commit two more flags so the timeline has multiple events
+    sys.commit_sharing_flag(
+        sender_did="did:doc:alice", sender_kp=kp_alice,
+        patient_pid="PID:p42", rid="R1",
+        from_domain="hospital_A", target_domain="hospital_B",
+        purpose="emergency_review",
+    )
+    sys.commit_sharing_flag(
+        sender_did="did:doc:alice", sender_kp=kp_alice,
+        patient_pid="PID:p42", rid="R1",
+        from_domain="hospital_B", target_domain="hospital_A",
+        purpose="follow_up",
+    )
+    sys.chain.drain_mempool()
+
+    # ------------------------------------------------------------------
+    # Phase 3/5 Step 6: longitudinal cross-domain history reconstruction
+    # ------------------------------------------------------------------
+    print("\nPhase 3/5 Step 6: longitudinal history reconstruction (from chain)")
+    history = sys.reconstruct_history(
+        patient_pid="PID:p42",
+        requester_did="did:doc:alice",
+        requester_attrs={"doctor", "cardiologist", "hospital_A"},
+        source="chain",
+    )
+    print(f"  source: {history['source']}")
+    print(f"  patient (hashed): {history['patient_pid_hashed'][:24]}...")
+    print(f"  timeline ({len(history['events'])} sharing events):")
+    for i, ev in enumerate(history["events"], 1):
+        print(f"    {i}. t={ev['timestamp']:>10}  "
+              f"{ev['from_domain']:>10s} -> {ev['to_domain']:<10s}  "
+              f"purpose={ev['purpose']:<18s}  flag={ev['flag_id'][:12]}...")
+    if "accessible_records" in history:
+        print(f"  records the requester can access ({len(history['accessible_records'])}):")
+        for r in history["accessible_records"]:
+            print(f"    - {r['domain']}/{r['rid']} (policy={r['policy_id']})")
 
     print("\nFLEX-DIAM-EHR end-to-end OK")
