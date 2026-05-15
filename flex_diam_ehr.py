@@ -389,6 +389,122 @@ class FlexDiamEHRSystem:
         self.chain.broadcast_tx(tx)
         return flag_id
 
+    # ------------------------------------------------------------------
+    # Phase 3 Step 6 + Phase 5 Step 6:
+    # Verifiable Cross-Domain History Reconstruction
+    # ------------------------------------------------------------------
+    def reconstruct_history(
+        self,
+        patient_pid: str,
+        requester_did: Optional[str] = None,
+        requester_attrs: Optional[Set[str]] = None,
+        source: str = "chain",
+    ) -> Dict[str, Any]:
+        """Retrieve all cross-domain sharing flags for a patient and
+        reconstruct the patient's distributed EHR history.
+
+        Implements Phase 3 Step 6 ("Longitudinal EHR Reconstruction") and
+        Phase 5 Step 6 ("Verifiable Cross-Domain History Reconstruction")
+        from the FLEX-DIAM-EHR paper.
+
+        Args:
+            patient_pid: the (unhashed) patient identifier. Pseudonymized
+                the same way ``commit_sharing_flag`` did so it matches
+                the on-chain key.
+            requester_did, requester_attrs: optional. When both supplied,
+                the function also resolves each flag to records the
+                requester can actually access in the local graph at each
+                domain — enforcing the paper's "Access to any record
+                further requires successful ZKP-based authentication"
+                gate at the policy layer. (The ZKP itself must still be
+                verified separately via ``doctor_authenticate`` /
+                ``verify_and_access``.)
+            source: ``"chain"`` queries ``Flagged`` events directly from
+                the deployed FlexDiamEHR.sol via web3.py — the strict
+                interpretation of "retrieve from the consortium
+                blockchain". ``"mirror"`` reads the in-memory
+                ``ChainState`` mirror that is updated synchronously on
+                each receipt. Falls back to ``"mirror"`` if the chain
+                query fails.
+
+        Returns a dict with:
+            patient_pid_hashed: the hashed PID used for the chain lookup
+            source: which source the events actually came from
+            events: list of dicts, one per FlagID belonging to the patient
+            accessible_records: list of records the requester can read
+                (only present when requester_did + requester_attrs given)
+        """
+        hashed_pid = H(patient_pid).hex()
+        events: List[Dict[str, Any]] = []
+        resolved_source = source
+
+        if source == "chain":
+            try:
+                logs = self.chain.contract.events.Flagged().get_logs(fromBlock=0)
+                for log in logs:
+                    args = log["args"]
+                    if args["patientPid"] != hashed_pid:
+                        continue
+                    events.append({
+                        "flag_id": args["flagId"],
+                        "from_domain": args["hA"],
+                        "to_domain": args["hB"],
+                        "purpose": args["purpose"],
+                        "sender_did": args["senderDid"],
+                        "timestamp": int(args["timestamp"]),
+                        "tx_hash": log["transactionHash"].hex(),
+                        "block_number": log["blockNumber"],
+                    })
+            except Exception:
+                # Fallback to mirror (e.g., events filter not supported)
+                resolved_source = "mirror"
+                events = []
+
+        if resolved_source == "mirror":
+            state = self.chain.total_chain_state()
+            for f in state.flags.get(hashed_pid, []):
+                events.append({
+                    "flag_id": f["flag_id"],
+                    "from_domain": f["h_a"],
+                    "to_domain": f["h_b"],
+                    "purpose": f.get("purpose", ""),
+                    "sender_did": None,
+                    "timestamp": float(f["t"]),
+                    "tx_hash": f.get("tx_hash"),
+                    "block_number": None,
+                })
+
+        # Sort by timestamp so the reconstructed history is a real timeline
+        events.sort(key=lambda e: (e["timestamp"] or 0))
+
+        result: Dict[str, Any] = {
+            "patient_pid_hashed": hashed_pid,
+            "source": resolved_source,
+            "events": events,
+        }
+
+        # Phase 5 Step 6 access gate: when a requester is given, list the
+        # records they can actually read across the consortium's local graphs.
+        if requester_did is not None and requester_attrs is not None:
+            accessible: List[Dict[str, Any]] = []
+            for domain_id, graph in self.graphs.items():
+                if patient_pid not in graph.patients:
+                    continue
+                records = graph.policy_constrained_records(
+                    requester_did, patient_pid, requester_attrs
+                )
+                for rec in records:
+                    accessible.append({
+                        "domain": domain_id,
+                        "rid": rec.rid,
+                        "policy_id": rec.policy_id,
+                        "phi": rec.phi.hex(),
+                        "uri": rec.uri,
+                    })
+            result["accessible_records"] = accessible
+
+        return result
+
 
 if __name__ == "__main__":
     print("Setting up FLEX-DIAM-EHR system...")
@@ -464,5 +580,42 @@ if __name__ == "__main__":
     flags_on_chain = sys.chain.total_chain_state().flags
     print(f"  flags on chain: {len(flags_on_chain)} patients, "
           f"{sum(len(v) for v in flags_on_chain.values())} total")
+
+    # Commit two more flags so the timeline has multiple events
+    sys.commit_sharing_flag(
+        sender_did="did:doc:alice", sender_kp=kp_alice,
+        patient_pid="PID:p42", rid="R1",
+        from_domain="hospital_A", target_domain="hospital_B",
+        purpose="emergency_review",
+    )
+    sys.commit_sharing_flag(
+        sender_did="did:doc:alice", sender_kp=kp_alice,
+        patient_pid="PID:p42", rid="R1",
+        from_domain="hospital_B", target_domain="hospital_A",
+        purpose="follow_up",
+    )
+    sys.chain.drain_mempool()
+
+    # ------------------------------------------------------------------
+    # Phase 3/5 Step 6: longitudinal cross-domain history reconstruction
+    # ------------------------------------------------------------------
+    print("\nPhase 3/5 Step 6: longitudinal history reconstruction (from chain)")
+    history = sys.reconstruct_history(
+        patient_pid="PID:p42",
+        requester_did="did:doc:alice",
+        requester_attrs={"doctor", "cardiologist", "hospital_A"},
+        source="chain",
+    )
+    print(f"  source: {history['source']}")
+    print(f"  patient (hashed): {history['patient_pid_hashed'][:24]}...")
+    print(f"  timeline ({len(history['events'])} sharing events):")
+    for i, ev in enumerate(history["events"], 1):
+        print(f"    {i}. t={ev['timestamp']:>10}  "
+              f"{ev['from_domain']:>10s} -> {ev['to_domain']:<10s}  "
+              f"purpose={ev['purpose']:<18s}  flag={ev['flag_id'][:12]}...")
+    if "accessible_records" in history:
+        print(f"  records the requester can access ({len(history['accessible_records'])}):")
+        for r in history["accessible_records"]:
+            print(f"    - {r['domain']}/{r['rid']} (policy={r['policy_id']})")
 
     print("\nFLEX-DIAM-EHR end-to-end OK")
