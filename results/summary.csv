@@ -1,7 +1,7 @@
 operation,Scheme [25],Scheme [27],Scheme [31],FLEX-DIAM-EHR
-Authentication (10 requests),839.455,N/A,1733.404,125.083
-Authorization (1 req),N/A,13673.391,N/A,13594.559
-Data Encryption (1 MB),1.220,239.370,1.167,5.224
-Delegation (1 req),0.034,242.351,65.515,20.548
-Cross-Domain (5 records),417.655,68273.947,962.935,3639.631
-Traceability (10 logs),836.198,N/A,910.054,797.539
+Authentication (10 requests),833.515,N/A,2166.804,131.624
+Authorization (1 req),N/A,13783.738,N/A,14521.919
+Data Encryption (1 MB),1.171,250.295,1.081,5.434
+Delegation (1 req),0.039,234.657,86.053,23.462
+Cross-Domain (5 records),423.312,73583.724,1036.292,3788.816
+Traceability (10 logs),877.222,N/A,1071.117,834.015

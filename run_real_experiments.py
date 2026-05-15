@@ -57,7 +57,7 @@ RESULTS_DIR.mkdir(exist_ok=True)
 # Each (scheme, x) measurement is repeated REPEATS times and we report the
 # MEDIAN — robust against single-run outliers (GC pauses, OS scheduling).
 # 3 is a reasonable balance between noise reduction and total runtime.
-REPEATS = 1
+REPEATS = 5
 
 # Default policy attributes (universe must contain them)
 UNIVERSE = ["doctor", "cardiologist", "hospital_A", "hospital_B", "emergency", "researcher"]
