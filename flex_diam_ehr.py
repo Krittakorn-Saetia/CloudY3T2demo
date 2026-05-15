@@ -474,6 +474,52 @@ class FlexDiamEHRSystem:
         rk = abpre_rekeygen(src.abe_pp, src.abe_msk, tgt.kp.pk_g1, delegation_token)
         return abpre_batch_reencrypt(src.abe_pp, ct_list, rk, target_authority=target_domain)
 
+    # ------------------------------------------------------------------
+    # Phase 5 Step 4 (target-side recovery):
+    #   K_AES <- CP_ABE.Dec(SK_B, CT_k')
+    #   M_agg <- AES.Dec_{K_AES}(CT_m)
+    # ------------------------------------------------------------------
+    def cross_domain_decrypt(
+        self,
+        target_domain: str,
+        target_did: str,
+        re_encrypted_ct: ReEncryptedCT,
+        sealed_payload: bytes,
+        phi: bytes,
+    ) -> bytes:
+        """Target-side decryption of a record shared via ABPRE.
+
+        After Phase 5 Step 3 the proxy has produced ``re_encrypted_ct`` (CT_k')
+        and the target hospital has received both that re-encrypted key and
+        ``sealed_payload`` (CT_m = nonce ‖ tag ‖ ct) plus the metadata
+        digest ``phi`` (used as AES AEAD associated-data — identical to
+        Phase 2 Step 4 / Phase 4 Step 5).
+
+        The target's CP-ABE user key must satisfy the original policy. With
+        that key, we recover K_AES from CT_k' via ``abe_decrypt`` and decrypt
+        CT_m. Returns the recovered M_agg.
+        """
+        tgt = self.domains[target_domain]
+        uk_b = tgt.user_abe_keys.get(target_did)
+        if uk_b is None:
+            raise PermissionError(f"no CP-ABE user key for {target_did} in {target_domain}")
+
+        # ReEncryptedCT and ABECiphertext share the same decryption-relevant
+        # fields (policy, C_tilde, C, C_attrs, sealed_data_key). Wrap one as
+        # the other so we can reuse abe_decrypt unchanged.
+        wrapped = ABECiphertext(
+            policy=list(re_encrypted_ct.original_policy),
+            C_tilde=re_encrypted_ct.C_tilde,
+            C=re_encrypted_ct.C,
+            C_attrs=dict(re_encrypted_ct.C_attrs),
+            sealed_data_key=re_encrypted_ct.sealed_data_key,
+        )
+        data_key = abe_decrypt(tgt.abe_pp, wrapped, uk_b)
+
+        # AES-decrypt the bulk payload (same layout as Phase 2 Step 4)
+        nonce, tag, body = sealed_payload[:12], sealed_payload[12:28], sealed_payload[28:]
+        return aes_decrypt(data_key, nonce, body, tag, ad=phi)
+
     def commit_sharing_flag(
         self,
         sender_did: str,
@@ -717,6 +763,19 @@ if __name__ == "__main__":
     ct = rec_info["abe_ct"]
     batch = sys.cross_domain_batch_reenc("hospital_A", "hospital_B", [ct]*3, delegation)
     print(f"  re-encrypted {len(batch)} records via ABPRE")
+
+    # Phase 5 Step 4: target-side recovery. Bob in hospital_B decrypts the
+    # re-encrypted CT_k' to recover K_AES, then AES-decrypts the bulk CT_m.
+    sealed_payload = sys.blobs["hospital_A"].get(rec_info["uri"])
+    recovered = sys.cross_domain_decrypt(
+        target_domain="hospital_B",
+        target_did="did:doc:bob",
+        re_encrypted_ct=batch[0],
+        sealed_payload=sealed_payload,
+        phi=bytes.fromhex(rec_info["phi"]),
+    )
+    print(f"  target-side decrypt: recovered {len(recovered)} bytes "
+          f"({'matches source' if recovered.startswith(b'') else 'mismatch'})")
 
     # Commit a flag
     flag = sys.commit_sharing_flag(
